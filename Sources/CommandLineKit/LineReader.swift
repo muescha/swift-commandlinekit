@@ -65,6 +65,22 @@ public class LineReader {
   /// A callback for handling hints
   private var hintsCallback: ((String) -> (String, TextProperties)?)?
 
+  /// A callback for the completion menu; replaces `completionCallback` when set
+  private var completionMenuCallback: ((String) -> [LineCompletion])?
+
+  /// The maximum number of candidates the completion menu shows at once.
+  public var completionMenuHeight = 8
+
+  /// How long to wait after Esc for the rest of an escape sequence (an arrow key sends Esc and
+  /// two more bytes at once); without more input it was the Esc key itself.
+  private static let escapeSequenceTimeout: Int32 = 50
+
+  /// How the completion menu shows the selected candidate.
+  public var completionMenuSelectedProperties = TextProperties(textStyles: [.swap])
+
+  /// How the completion menu shows the details of the candidates that aren't selected.
+  public var completionMenuDetailProperties = TextProperties(textColor: .grey)
+
   /// A POSIX file handle for the input
   private let inputFile: Int32
 
@@ -118,6 +134,15 @@ public class LineReader {
   /// an array of Strings containing possible completions.
   public func setCompletionCallback(_ callback: @escaping (String) -> [String]) {
     self.completionCallback = callback
+  }
+
+  /// Adds a callback for a completion menu. The callback is taking the current text and
+  /// returning the candidates. On Tab, a single candidate is accepted right away; for more,
+  /// the line is extended to what they share and a menu opens below it: Tab, Down and Up move
+  /// the selection (previewed as a hint after the cursor), Return or Right accepts it, Esc
+  /// closes the menu, and typing filters it. Takes precedence over `setCompletionCallback`.
+  public func setCompletionMenuCallback(_ callback: @escaping (String) -> [LineCompletion]) {
+    self.completionMenuCallback = callback
   }
 
   /// Adds a callback for hints as you type. The callback is taking the current text and
@@ -211,7 +236,12 @@ public class LineReader {
         guard var char = self.readByte() else {
           return
         }
-        if char == ControlCharacters.Tab.rawValue && self.completionCallback != nil,
+        if char == ControlCharacters.Tab.rawValue && self.completionMenuCallback != nil {
+          guard let completionChar = try self.completeWithMenu(editState: editState) else {
+            continue
+          }
+          char = completionChar
+        } else if char == ControlCharacters.Tab.rawValue && self.completionCallback != nil,
            let completionChar = try self.completeLine(editState: editState) {
           char = completionChar
         }
@@ -269,6 +299,78 @@ public class LineReader {
           if completionIndex < completions.count {
             try self.setBuffer(editState: editState, new: completions[completionIndex])
           }
+          return char
+      }
+    }
+  }
+
+  /// Completes with the menu. Returns a character the main loop should still handle, or `nil`
+  /// if the menu consumed all input.
+  private func completeWithMenu(editState: EditState) throws -> UInt8? {
+    guard let callback = self.completionMenuCallback else {
+      return nil
+    }
+    var menu = CompletionMenu(candidates: callback(editState.buffer))
+    guard !menu.candidates.isEmpty else {
+      self.ringBell()
+      return nil
+    }
+    // A single candidate, or one the others all start with: just take what they share
+    let common = menu.commonPrefix
+    if common.count > editState.buffer.count && common.hasPrefix(editState.buffer) {
+      try self.setBuffer(editState: editState, new: common)
+    }
+    if menu.candidates.count == 1 {
+      return nil
+    }
+    while true {
+      try self.refreshLine(editState: editState, menu: menu)
+      guard let char = self.readByte() else {
+        return nil
+      }
+      switch char {
+        case ControlCharacters.Tab.rawValue:
+          menu.move(by: 1, height: self.completionMenuHeight)
+        case ControlCharacters.Enter.rawValue:
+          try self.setBuffer(editState: editState, new: menu.candidates[menu.selected].text)
+          return nil
+        case ControlCharacters.Esc.rawValue:
+          guard self.waitForInput(milliseconds: LineReader.escapeSequenceTimeout) else {
+            // A lone Esc closes the menu
+            try self.refreshLine(editState: editState)
+            return nil
+          }
+          guard self.readCharacter() == "[" else {
+            break
+          }
+          var code = self.readCharacter()
+          while let c = code, c.isNumber || c == ";" {
+            code = self.readCharacter()
+          }
+          switch code {
+            case "A", "Z":
+              // Up, Shift-Tab
+              menu.move(by: -1, height: self.completionMenuHeight)
+            case "B":
+              // Down
+              menu.move(by: 1, height: self.completionMenuHeight)
+            case "C":
+              // Right accepts the selection, like Return
+              try self.setBuffer(editState: editState, new: menu.candidates[menu.selected].text)
+              return nil
+            default:
+              break
+          }
+        case ControlCharacters.Backspace.rawValue, 0x20..<0x7F, 0x80...0xFF:
+          // Edit the line, then filter the menu by it
+          _ = try self.handleCharacter(char, editState: editState)
+          menu = CompletionMenu(candidates: callback(editState.buffer))
+          guard menu.candidates.count > 1 else {
+            try self.refreshLine(editState: editState)
+            return nil
+          }
+        default:
+          try self.refreshLine(editState: editState)
           return char
       }
     }
@@ -527,7 +629,9 @@ public class LineReader {
     }
   }
 
-  private func refreshLine(editState: EditState, decorate: Bool = true) throws {
+  private func refreshLine(editState: EditState,
+                           decorate: Bool = true,
+                           menu: CompletionMenu? = nil) throws {
     let cursorWidth = editState.cursorWidth
     let numColumns = self.numColumns
     let cursorRows = cursorWidth / numColumns
@@ -555,19 +659,66 @@ public class LineReader {
     } else {
       commandBuf += editState.readProperties.apply(to: editState.buffer)
     }
-    let (hints, hintsWidth) = decorate ? try self.refreshHints(editState: editState) : ("", 0)
+    var (hints, hintsWidth) = decorate && menu == nil ? try self.refreshHints(editState: editState) : ("", 0)
+    if decorate, let menu = menu {
+      // The hint previews the selected candidate
+      let text = menu.candidates[menu.selected].text
+      if text.hasPrefix(editState.buffer) && text.count > editState.buffer.count {
+        let preview = String(text.dropFirst(editState.buffer.count))
+        hints = self.completionMenuDetailProperties.apply(to: preview)
+        hintsWidth = preview.count
+      }
+    }
     commandBuf += hints.isEmpty ? " " : hints
     // The row the line ends on. Text ending exactly at the right edge leaves the cursor on its
     // last row: the terminal wraps only when the next character comes.
     let lineWidth = editState.prompt.count + editState.buffer.count + max(1, hintsWidth)
     let endRow = (lineWidth - 1) / numColumns
+    var menuRows = 0
+    if let menu = menu {
+      let rows = self.menuRows(menu)
+      commandBuf += rows.map { "\r\n" + AnsiCodes.clearLine + $0 }.joined()
+      menuRows = rows.count
+    }
     commandBuf += AnsiCodes.clearCursorToBottom +
-                  AnsiCodes.cursorUp(endRow) +
+                  AnsiCodes.cursorUp(menuRows + endRow) +
                   AnsiCodes.beginningOfLine +
                   AnsiCodes.cursorDown(cursorRows) +
                   AnsiCodes.cursorForward(cursorCols)
     try self.output(text: commandBuf)
     editState.cursorRow = cursorRows
+  }
+
+  /// The rows of the completion menu: the visible candidates and a position indicator.
+  private func menuRows(_ menu: CompletionMenu) -> [String] {
+    let numColumns = self.numColumns
+    let visible = menu.candidates[menu.top..<min(menu.top + self.completionMenuHeight,
+                                                 menu.candidates.count)]
+    let labelWidth = min(visible.map { $0.label.count }.max() ?? 0, numColumns - 2)
+    var rows = visible.indices.map { index -> String in
+      let candidate = menu.candidates[index]
+      let label = String(candidate.label.prefix(labelWidth))
+      let padded = label + String(repeating: " ", count: labelWidth - label.count)
+      let detailWidth = numColumns - labelWidth - 5
+      let detail = detailWidth > 0 ? String((candidate.detail ?? "").prefix(detailWidth)) : ""
+      if index == menu.selected {
+        let row = " " + padded + (detail.isEmpty ? "" : "  " + detail) + " "
+        return self.completionMenuSelectedProperties.apply(to: row)
+      }
+      return " " + padded +
+             (detail.isEmpty ? "" : "  " + self.completionMenuDetailProperties.apply(to: detail))
+    }
+    if menu.candidates.count > visible.count {
+      rows.append(self.completionMenuDetailProperties.apply(
+        to: " \(menu.selected + 1)/\(menu.candidates.count)"))
+    }
+    return rows
+  }
+
+  /// Waits up to `milliseconds` for input; tells a lone Esc from an escape sequence.
+  private func waitForInput(milliseconds: Int32) -> Bool {
+    var descriptor = pollfd(fd: self.inputFile, events: Int16(POLLIN), revents: 0)
+    return poll(&descriptor, 1, milliseconds) > 0
   }
 
   private func readByte() -> UInt8? {
