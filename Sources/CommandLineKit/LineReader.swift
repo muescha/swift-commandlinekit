@@ -84,6 +84,18 @@ public class LineReader {
   /// A POSIX file handle for the input
   private let inputFile: Int32
 
+  /// Text from `printAbove` waiting for the reading thread, guarded by `messageLock`
+  private var pendingMessages: [String] = []
+
+  /// Set while `readLine` is reading in raw mode, guarded by `messageLock`
+  private var isReading = false
+
+  /// Guards `pendingMessages` and `isReading`
+  private let messageLock = NSLock()
+
+  /// Wakes up the reading thread when `printAbove` queued text: [read end, write end]
+  private var messagePipe: [Int32] = [-1, -1]
+
   /// A POSIX file handle for the output
   private let outputFile: Int32
 
@@ -104,6 +116,31 @@ public class LineReader {
     self.history = LineReaderHistory()
     self.completionCallback = completionCallback
     self.hintsCallback = hintsCallback
+    if pipe(&self.messagePipe) == 0 {
+      _ = fcntl(self.messagePipe[0], F_SETFL, O_NONBLOCK)
+      _ = fcntl(self.messagePipe[1], F_SETFL, O_NONBLOCK)
+    }
+  }
+
+  deinit {
+    for descriptor in self.messagePipe where descriptor >= 0 {
+      close(descriptor)
+    }
+  }
+
+  /// Prints `text` above the line being read, then redraws the prompt, the input and an open
+  /// completion menu below it. Can be called from any thread, e.g. for log messages arriving
+  /// while the user types; while no line is being read, `text` is just printed.
+  public func printAbove(_ text: String) {
+    self.messageLock.lock()
+    defer { self.messageLock.unlock() }
+    guard self.isReading && self.messagePipe[1] >= 0 else {
+      Swift.print(text)
+      return
+    }
+    self.pendingMessages.append(text)
+    var wake: UInt8 = 1
+    _ = write(self.messagePipe[1], &wake, 1)
   }
 
   public static var supportedByTerminal: Bool {
@@ -223,6 +260,13 @@ public class LineReader {
     if fileno(stdout) == self.outputFile {
       fflush(stdout)
     }
+    self.setReading(true)
+    defer {
+      // Text that arrived after the line was read is printed normally
+      for message in self.setReading(false) {
+        Swift.print(message)
+      }
+    }
     try self.withRawMode {
       if let col = self.cursorColumn, col > 1 {
         try self.output(text: "\n" + AnsiCodes.setCursorColumn(0))
@@ -234,7 +278,7 @@ public class LineReader {
                                 readProperties: readProperties,
                                 parenProperties: parenProperties)
       while true {
-        guard var char = self.readByte() else {
+        guard var char = try self.readByte(editState: editState) else {
           return
         }
         if char == ControlCharacters.Tab.rawValue && self.completionMenuCallback != nil {
@@ -326,7 +370,7 @@ public class LineReader {
     }
     while true {
       try self.refreshLine(editState: editState, menu: menu)
-      guard let char = self.readByte() else {
+      guard let char = try self.readByte(editState: editState, menu: menu) else {
         return nil
       }
       switch char {
@@ -720,6 +764,49 @@ public class LineReader {
         to: " \(menu.selected + 1)/\(menu.candidates.count)"))
     }
     return rows
+  }
+
+  /// Sets `isReading` and returns the text `printAbove` queued so far.
+  @discardableResult
+  private func setReading(_ reading: Bool) -> [String] {
+    self.messageLock.lock()
+    defer { self.messageLock.unlock() }
+    self.isReading = reading
+    let messages = self.pendingMessages
+    self.pendingMessages = []
+    var drain = [UInt8](repeating: 0, count: 64)
+    while self.messagePipe[0] >= 0 && read(self.messagePipe[0], &drain, drain.count) > 0 {}
+    return messages
+  }
+
+  /// Reads the next input byte. Meanwhile, prints text from `printAbove` above the line and
+  /// redraws the line (and `menu`) below it.
+  private func readByte(editState: EditState, menu: CompletionMenu? = nil) throws -> UInt8? {
+    guard self.messagePipe[0] >= 0 else {
+      return self.readByte()
+    }
+    while true {
+      var descriptors = [pollfd(fd: self.inputFile, events: Int16(POLLIN), revents: 0),
+                         pollfd(fd: self.messagePipe[0], events: Int16(POLLIN), revents: 0)]
+      guard poll(&descriptors, 2, -1) >= 0 || errno == EINTR else {
+        return self.readByte()
+      }
+      if descriptors[1].revents & Int16(POLLIN) != 0 {
+        let messages = self.setReading(true)
+        if !messages.isEmpty {
+          let lines = messages.joined(separator: "\n")
+                              .split(separator: "\n", omittingEmptySubsequences: false)
+          try self.output(text: AnsiCodes.cursorUp(editState.cursorRow) + AnsiCodes.beginningOfLine +
+                                AnsiCodes.clearCursorToBottom +
+                                lines.joined(separator: "\r\n") + "\r\n")
+          editState.cursorRow = 0
+          try self.refreshLine(editState: editState, menu: menu)
+        }
+      }
+      if descriptors[0].revents & Int16(POLLIN | POLLHUP | POLLERR) != 0 {
+        return self.readByte()
+      }
+    }
   }
 
   /// Waits up to `milliseconds` for input; tells a lone Esc from an escape sequence.
