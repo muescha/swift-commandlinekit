@@ -146,7 +146,8 @@ public class LineReader {
   }
 
   /// Adds a callback for hints as you type. The callback is taking the current text and
-  /// optionally returning the hint and a tuple of RGB colours for the hint text.
+  /// optionally returning the hint and a tuple of RGB colours for the hint text. Right at the
+  /// end of the line accepts the hint.
   public func setHintsCallback(_ callback: @escaping (String) -> (String, TextProperties)?) {
     self.hintsCallback = callback
   }
@@ -523,7 +524,13 @@ public class LineReader {
           case "B":
             try self.moveHistory(editState: editState, direction: .next)
           case "C":
-            try self.moveRight(editState: editState)
+            // At the end of the line, Right accepts the hint
+            if editState.cursorAtEnd, let hint = self.hintsCallback?(editState.buffer)?.0,
+               !hint.isEmpty {
+              try self.setBuffer(editState: editState, new: editState.buffer + hint)
+            } else {
+              try self.moveRight(editState: editState)
+            }
           case "D":
             try self.moveLeft(editState: editState)
           case "H":
