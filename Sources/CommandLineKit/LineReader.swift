@@ -128,6 +128,20 @@ public class LineReader {
     }
   }
 
+  /// Erases the line just read, the prompt and the input over as many rows as they took, e.g. to
+  /// replace it with an echo that arrives through `printAbove`. `promptWidth` is the width of the
+  /// prompt plus the input, in columns.
+  public func eraseLastLine(promptWidth: Int) {
+    guard self.termSupported else {
+      return
+    }
+    // The cursor is on the row below the input. Input ending exactly at the right edge still
+    // took a row more: the space drawn after it wrapped.
+    let rows = promptWidth / self.numColumns + 1
+    try? self.output(text: AnsiCodes.cursorUp(rows) + AnsiCodes.beginningOfLine +
+                           AnsiCodes.clearCursorToBottom)
+  }
+
   /// Prints `text` above the line being read, then redraws the prompt, the input and an open
   /// completion menu below it. Can be called from any thread, e.g. for log messages arriving
   /// while the user types; while no line is being read, `text` is just printed.
