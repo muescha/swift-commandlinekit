@@ -1,5 +1,5 @@
 //
-//  LineCompletion.swift
+//  CompletionMenu.swift
 //  CommandLineKit
 //
 //  Redistribution and use in source and binary forms, with or without
@@ -30,21 +30,32 @@
 
 import Foundation
 
-/// A candidate for the completion menu of `LineReader` (see `setCompletionMenuCallback`).
-public struct LineCompletion {
+/// The state of an open completion menu.
+internal struct CompletionMenu {
+  var candidates: [LineCompletion]
+  var selected = 0
+  var top = 0
 
-  /// The whole line after choosing this candidate.
-  public let text: String
+  init(candidates: [LineCompletion]) {
+    self.candidates = candidates
+  }
 
-  /// What the menu shows for this candidate, usually just the completed name.
-  public let label: String
+  mutating func move(by offset: Int, height: Int) {
+    let count = self.candidates.count
+    self.selected = ((self.selected + offset) % count + count) % count
+    self.top = min(max(self.top, self.selected - height + 1), self.selected)
+  }
 
-  /// Shown dimmed next to the label, e.g. a signature or a type.
-  public let detail: String?
-
-  public init(text: String, label: String? = nil, detail: String? = nil) {
-    self.text = text
-    self.label = label ?? text
-    self.detail = detail
+  /// The longest prefix all candidates share.
+  var commonPrefix: String {
+    guard var prefix = self.candidates.first?.text else {
+      return ""
+    }
+    for candidate in self.candidates.dropFirst() {
+      while !candidate.text.hasPrefix(prefix) {
+        prefix.removeLast()
+      }
+    }
+    return prefix
   }
 }
