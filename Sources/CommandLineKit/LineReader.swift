@@ -361,11 +361,11 @@ public class LineReader {
         }
         let char = Character(UnicodeScalar(scalar) ?? UnicodeScalar(" "))
         if editState.insertCharacter(char) {
-          try refreshLine(editState: editState)
+          // More input waiting is pasted text: draw the line once, after its last character
+          if self.bytesAvailable == 0 {
+            try refreshLine(editState: editState)
+          }
         } else {
-          self.ringBell()
-        }
-        if self.bytesAvailable > 0 {
           self.ringBell()
         }
     }
