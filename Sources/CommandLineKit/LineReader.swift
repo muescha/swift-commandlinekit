@@ -304,6 +304,7 @@ public class LineReader {
       case ControlCharacters.CtrlL.rawValue:
         // Clear screen
         try self.clearScreen()
+        editState.cursorRow = 0
         try self.refreshLine(editState: editState)
       case ControlCharacters.CtrlT.rawValue:
         if editState.swapCharacterWithPrevious() {
@@ -518,10 +519,11 @@ public class LineReader {
       let numColumns = self.numColumns
       let cursorRows = cursorWidth / numColumns
       let cursorCols = cursorWidth % numColumns
-      var commandBuf = AnsiCodes.beginningOfLine
+      var commandBuf = AnsiCodes.cursorUp(editState.cursorRow) + AnsiCodes.beginningOfLine
       commandBuf += AnsiCodes.cursorDown(cursorRows)
       commandBuf += AnsiCodes.cursorForward(cursorCols)
       try self.output(text: commandBuf)
+      editState.cursorRow = cursorRows
     }
   }
 
@@ -530,7 +532,9 @@ public class LineReader {
     let numColumns = self.numColumns
     let cursorRows = cursorWidth / numColumns
     let cursorCols = cursorWidth % numColumns
-    var commandBuf = AnsiCodes.beginningOfLine +
+    // Back to where the prompt starts: the line may wrap over several rows
+    var commandBuf = AnsiCodes.cursorUp(editState.cursorRow) +
+                     AnsiCodes.beginningOfLine +
                      editState.promptProperties.apply(to: editState.prompt)
     if decorate, let idx = editState.matchingParen() {
       var fst = editState.buffer.index(before: editState.location)
@@ -551,13 +555,19 @@ public class LineReader {
     } else {
       commandBuf += editState.readProperties.apply(to: editState.buffer)
     }
-    let hints = decorate ? try self.refreshHints(editState: editState) : ""
+    let (hints, hintsWidth) = decorate ? try self.refreshHints(editState: editState) : ("", 0)
     commandBuf += hints.isEmpty ? " " : hints
+    // The row the line ends on. Text ending exactly at the right edge leaves the cursor on its
+    // last row: the terminal wraps only when the next character comes.
+    let lineWidth = editState.prompt.count + editState.buffer.count + max(1, hintsWidth)
+    let endRow = (lineWidth - 1) / numColumns
     commandBuf += AnsiCodes.clearCursorToBottom +
+                  AnsiCodes.cursorUp(endRow) +
                   AnsiCodes.beginningOfLine +
                   AnsiCodes.cursorDown(cursorRows) +
                   AnsiCodes.cursorForward(cursorCols)
     try self.output(text: commandBuf)
+    editState.cursorRow = cursorRows
   }
 
   private func readByte() -> UInt8? {
@@ -679,16 +689,17 @@ public class LineReader {
     }
   }
 
-  private func refreshHints(editState: EditState) throws -> String {
+  /// The hint with its terminal colors, and its width in columns.
+  private func refreshHints(editState: EditState) throws -> (String, Int) {
     guard let hintsCallback = self.hintsCallback,
           let (hint, properties) = hintsCallback(editState.buffer) else {
-      return ""
+      return ("", 0)
     }
     let currentLineLength = editState.prompt.count + editState.buffer.count
     if hint.count + currentLineLength > self.numColumns {
-      return ""
+      return ("", 0)
     } else {
-      return properties.apply(to: hint) + AnsiCodes.origTermColor
+      return (properties.apply(to: hint) + AnsiCodes.origTermColor, hint.count)
     }
   }
 

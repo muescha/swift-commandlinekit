@@ -44,6 +44,9 @@ internal class EditState {
   let maxCount: Int?
   var buffer: String
   var location: String.Index
+  /// The screen row the terminal cursor is on, counted from the row the prompt starts on;
+  /// a line wider than the terminal wraps onto further rows.
+  var cursorRow = 0
   
   init(prompt: String,
        maxCount: Int? = nil,
