@@ -48,3 +48,15 @@ public struct LineCompletion {
     self.detail = detail
   }
 }
+
+/// What opened the completion menu of `LineReader`; see `setCompletionMenuCallback`.
+public enum LineCompletionTrigger: Equatable {
+
+  /// The user pressed Tab.
+  case tab
+
+  /// The line ended in one of `LineReader.completionMenuTriggers`: typed, or by accepting a
+  /// candidate. The menu then opens only when there are candidates, so a callback may want to
+  /// skip lookups here that are slow or have side effects, and do them only for Tab.
+  case typed(Character)
+}

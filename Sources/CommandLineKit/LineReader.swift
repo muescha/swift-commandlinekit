@@ -66,7 +66,12 @@ public class LineReader {
   private var hintsCallback: ((String) -> (String, TextProperties)?)?
 
   /// A callback for the completion menu; replaces `completionCallback` when set
-  private var completionMenuCallback: ((String) -> [LineCompletion])?
+  private var completionMenuCallback: ((String, LineCompletionTrigger) -> [LineCompletion])?
+
+  /// Typing one of these at the end of the line opens the completion menu by itself, without
+  /// Tab, when it has candidates (e.g. `"."` after an object name), and so does accepting a
+  /// candidate that ends in one. Empty by default.
+  public var completionMenuTriggers: Set<Character> = []
 
   /// The maximum number of candidates the completion menu shows at once.
   public var completionMenuHeight = 8
@@ -193,6 +198,14 @@ public class LineReader {
   /// the selection (previewed as a hint after the cursor), Return or Right accepts it, Esc
   /// closes the menu, and typing filters it. Takes precedence over `setCompletionCallback`.
   public func setCompletionMenuCallback(_ callback: @escaping (String) -> [LineCompletion]) {
+    self.completionMenuCallback = { buffer, _ in callback(buffer) }
+  }
+
+  /// Like `setCompletionMenuCallback(_:)`, but the callback also learns what opened the menu:
+  /// Tab, or a trigger from `completionMenuTriggers` (see `LineCompletionTrigger`). Only needed
+  /// when the candidates should depend on it.
+  public func setCompletionMenuCallback(
+      _ callback: @escaping (String, LineCompletionTrigger) -> [LineCompletion]) {
     self.completionMenuCallback = callback
   }
 
@@ -291,12 +304,16 @@ public class LineReader {
                                 promptProperties: promptProperties,
                                 readProperties: readProperties,
                                 parenProperties: parenProperties)
+      // A character the completion menu handed back, to handle before reading the next one
+      var pending: UInt8? = nil
       while true {
-        guard var char = try self.readByte(editState: editState) else {
+        guard var char = try pending ?? self.readByte(editState: editState) else {
           return
         }
+        pending = nil
         if char == ControlCharacters.Tab.rawValue && self.completionMenuCallback != nil {
-          guard let completionChar = try self.completeWithMenu(editState: editState) else {
+          guard let completionChar = try self.completeWithMenu(editState: editState,
+                                                               trigger: .tab) else {
             continue
           }
           char = completionChar
@@ -312,6 +329,10 @@ public class LineReader {
           try self.output(text: "\n" + AnsiCodes.setCursorColumn(0))
           line = rv
           return
+        }
+        if char < 0x80 && self.completionMenuTriggers.contains(Character(UnicodeScalar(char))),
+           let trigger = self.typedTrigger(editState) {
+          pending = try self.completeWithMenu(editState: editState, trigger: trigger)
         }
       }
     }
@@ -363,23 +384,61 @@ public class LineReader {
     }
   }
 
+  /// The trigger the line now ends in at the cursor, from `completionMenuTriggers`, so the
+  /// menu opens by itself; `nil` if none.
+  private func typedTrigger(_ editState: EditState) -> LineCompletionTrigger? {
+    guard self.completionMenuCallback != nil, editState.cursorAtEnd,
+          let last = editState.buffer.last, self.completionMenuTriggers.contains(last) else {
+      return nil
+    }
+    return .typed(last)
+  }
+
+  /// Whether a menu that opened by itself is worth showing: a candidate still adds something.
+  private func offersMore(_ menu: CompletionMenu, editState: EditState) -> Bool {
+    return menu.candidates.contains { $0.text != editState.buffer }
+  }
+
+  /// Accepts `text`. Returns the trigger it ends in, if any, so the menu opens again for it.
+  private func accept(_ text: String, editState: EditState) throws -> LineCompletionTrigger? {
+    try self.setBuffer(editState: editState, new: text)
+    return self.typedTrigger(editState)
+  }
+
   /// Completes with the menu. Returns a character the main loop should still handle, or `nil`
-  /// if the menu consumed all input.
-  private func completeWithMenu(editState: EditState) throws -> UInt8? {
+  /// if the menu consumed all input. Opened by Tab, it takes what the candidates share and
+  /// rings the bell if there are none; opened by a trigger, it only shows them. Accepting a
+  /// candidate that ends in a trigger opens the menu for it right away.
+  private func completeWithMenu(editState: EditState,
+                                trigger: LineCompletionTrigger) throws -> UInt8? {
     guard let callback = self.completionMenuCallback else {
       return nil
     }
-    var menu = CompletionMenu(candidates: callback(editState.buffer))
-    guard !menu.candidates.isEmpty else {
-      self.ringBell()
-      return nil
+    var trigger = trigger
+    var menu = CompletionMenu(candidates: callback(editState.buffer, trigger))
+    // Opens the menu again for the line as it is now, which ends in `typed`; `false` if there
+    // is nothing to show
+    func reopen(_ typed: LineCompletionTrigger) throws -> Bool {
+      trigger = typed
+      menu = CompletionMenu(candidates: callback(editState.buffer, typed))
+      return self.offersMore(menu, editState: editState)
     }
-    // A single candidate, or one the others all start with: just take what they share
-    let common = menu.commonPrefix
-    if common.count > editState.buffer.count && common.hasPrefix(editState.buffer) {
-      try self.setBuffer(editState: editState, new: common)
-    }
-    if menu.candidates.count == 1 {
+    if trigger == .tab {
+      guard !menu.candidates.isEmpty else {
+        self.ringBell()
+        return nil
+      }
+      // A single candidate, or one the others all start with: just take what they share
+      let common = menu.commonPrefix
+      if common.count > editState.buffer.count && common.hasPrefix(editState.buffer) {
+        try self.setBuffer(editState: editState, new: common)
+      }
+      if menu.candidates.count == 1 {
+        guard let typed = self.typedTrigger(editState), try reopen(typed) else {
+          return nil
+        }
+      }
+    } else if !self.offersMore(menu, editState: editState) {
       return nil
     }
     while true {
@@ -391,8 +450,11 @@ public class LineReader {
         case ControlCharacters.Tab.rawValue:
           menu.move(by: 1, height: self.completionMenuHeight)
         case ControlCharacters.Enter.rawValue:
-          try self.setBuffer(editState: editState, new: menu.candidates[menu.selected].text)
-          return nil
+          guard let typed = try self.accept(menu.candidates[menu.selected].text, editState: editState),
+                try reopen(typed) else {
+            try self.refreshLine(editState: editState)
+            return nil
+          }
         case ControlCharacters.Esc.rawValue:
           guard self.waitForInput(milliseconds: LineReader.escapeSequenceTimeout) else {
             // A lone Esc closes the menu
@@ -415,16 +477,26 @@ public class LineReader {
               menu.move(by: 1, height: self.completionMenuHeight)
             case "C":
               // Right accepts the selection, like Return
-              try self.setBuffer(editState: editState, new: menu.candidates[menu.selected].text)
-              return nil
+              guard let typed = try self.accept(menu.candidates[menu.selected].text,
+                                                editState: editState),
+                    try reopen(typed) else {
+                try self.refreshLine(editState: editState)
+                return nil
+              }
             default:
               break
           }
         case ControlCharacters.Backspace.rawValue, 0x20..<0x7F, 0x80...0xFF:
           // Edit the line, then filter the menu by it
           _ = try self.handleCharacter(char, editState: editState)
-          menu = CompletionMenu(candidates: callback(editState.buffer))
-          guard menu.candidates.count > 1 else {
+          // A trigger typed into the menu keeps it open the way it opens by itself
+          if let typed = self.typedTrigger(editState) {
+            trigger = typed
+          }
+          menu = CompletionMenu(candidates: callback(editState.buffer, trigger))
+          let keepsOpen = trigger == .tab ? menu.candidates.count > 1
+                                          : self.offersMore(menu, editState: editState)
+          guard keepsOpen else {
             try self.refreshLine(editState: editState)
             return nil
           }
