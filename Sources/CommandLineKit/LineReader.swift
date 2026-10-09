@@ -606,6 +606,10 @@ public class LineReader {
   }
 
   private func handleEscapeCode(editState: EditState) throws {
+    // A lone Esc does nothing; waiting for the rest of a sequence would take the next key
+    guard self.waitForInput(milliseconds: LineReader.escapeSequenceTimeout) else {
+      return
+    }
     let fst = self.readCharacter()
     switch fst {
       case "[":
